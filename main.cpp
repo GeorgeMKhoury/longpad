@@ -19,6 +19,10 @@
 #define IDM_FILE_SAVEAS 104
 #define IDM_FILE_EXIT   105
 #define IDM_FORMAT_FONT 106
+#define IDM_EDIT_FIND       107
+#define IDM_EDIT_FINDNEXT   108
+#define IDM_EDIT_FINDPREV   109
+#define IDM_EDIT_REPLACE    110
 
 // Control IDs
 #define ID_EDIT   201
@@ -38,6 +42,15 @@ static std::wstring g_currentFile;
 static bool      g_dirty   = false;
 static bool      g_loading = false;
 
+static WNDPROC g_editOrigProc = nullptr;
+
+// ---- Find/Replace state ----
+static HWND         g_hwndFR         = nullptr;
+static UINT         g_uFindMsg       = 0;
+static FINDREPLACEW g_fr             = {};
+static wchar_t      g_szFind[512]    = {};
+static wchar_t      g_szReplace[512] = {};
+
 static const wchar_t* REG_KEY = L"Software\\longpad";
 
 // ---- Forward declarations ----
@@ -53,6 +66,10 @@ static void DoSave();
 static void DoSaveAs();
 static void StartLoadFile(const std::wstring& path);
 static void SaveToPath(const std::wstring& path);
+static void DoFindReplace(bool showReplace);
+static bool FindNext(bool reverse);
+static void ReplaceOne();
+static void ReplaceAll();
 
 // ---- Utility ----
 static std::wstring BaseName(const std::wstring& path) {
@@ -113,6 +130,7 @@ static bool ConfirmDiscard() {
     std::wstring msg  = L"Save changes to \"" + name + L"\"?";
     int r = MessageBoxW(g_hwndMain, msg.c_str(), L"longpad", MB_YESNOCANCEL | MB_ICONQUESTION);
     if (r == IDCANCEL) return false;
+    if (r == IDNO)     return true;
     if (r == IDYES)    DoSave();
     return !g_dirty; // if save succeeded, dirty is cleared
 }
@@ -380,20 +398,145 @@ static void DoChooseFont() {
     SaveFontToRegistry();
 }
 
+// ---- RichEdit subclass: trim trailing space from double-click selection ----
+static LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_LBUTTONDBLCLK) {
+        LRESULT r = CallWindowProcW(g_editOrigProc, hwnd, msg, wp, lp);
+        CHARRANGE cr{};
+        SendMessageW(hwnd, EM_EXGETSEL, 0, (LPARAM)&cr);
+        if (cr.cpMax > cr.cpMin) {
+            wchar_t buf[2] = {};
+            TEXTRANGEW tr{};
+            tr.chrg.cpMin = cr.cpMax - 1;
+            tr.chrg.cpMax = cr.cpMax;
+            tr.lpstrText  = buf;
+            SendMessageW(hwnd, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
+            if (buf[0] == L' ' || buf[0] == L'\t') {
+                cr.cpMax--;
+                SendMessageW(hwnd, EM_EXSETSEL, 0, (LPARAM)&cr);
+            }
+        }
+        return r;
+    }
+    return CallWindowProcW(g_editOrigProc, hwnd, msg, wp, lp);
+}
+
+// ---- Find / Replace ----
+static void DoFindReplace(bool showReplace) {
+    if (g_hwndFR) { SetForegroundWindow(g_hwndFR); return; }
+    if (g_uFindMsg == 0)
+        g_uFindMsg = RegisterWindowMessageW(FINDMSGSTRING);
+    CHARRANGE cr{};
+    SendMessageW(g_hwndEdit, EM_EXGETSEL, 0, (LPARAM)&cr);
+    LONG selLen = cr.cpMax - cr.cpMin;
+    if (selLen > 0 && selLen < (LONG)ARRAYSIZE(g_szFind))
+        SendMessageW(g_hwndEdit, EM_GETSELTEXT, 0, (LPARAM)g_szFind);
+    g_fr = {};
+    g_fr.lStructSize      = sizeof(g_fr);
+    g_fr.hwndOwner        = g_hwndMain;
+    g_fr.lpstrFindWhat    = g_szFind;
+    g_fr.wFindWhatLen     = ARRAYSIZE(g_szFind);
+    g_fr.lpstrReplaceWith = g_szReplace;
+    g_fr.wReplaceWithLen  = ARRAYSIZE(g_szReplace);
+    g_fr.Flags            = FR_DOWN;
+    g_hwndFR = showReplace ? ReplaceTextW(&g_fr) : FindTextW(&g_fr);
+}
+
+static bool FindNext(bool reverse) {
+    if (g_szFind[0] == L'\0') { DoFindReplace(false); return false; }
+    CHARRANGE cr{};
+    SendMessageW(g_hwndEdit, EM_EXGETSEL, 0, (LPARAM)&cr);
+    LRESULT docLen = SendMessageW(g_hwndEdit, WM_GETTEXTLENGTH, 0, 0);
+    DWORD searchFlags = g_fr.Flags & ~FR_DOWN;
+    if (!reverse) searchFlags |= FR_DOWN;
+    FINDTEXTEXW ft{};
+    ft.lpstrText = g_szFind;
+    if (!reverse) { ft.chrg.cpMin = cr.cpMax;       ft.chrg.cpMax = -1; }
+    else          { ft.chrg.cpMin = cr.cpMin;        ft.chrg.cpMax = 0;  }
+    LRESULT pos = SendMessageW(g_hwndEdit, EM_FINDTEXTEX, (WPARAM)searchFlags, (LPARAM)&ft);
+    if (pos == -1) {
+        if (!reverse) { ft.chrg.cpMin = 0;             ft.chrg.cpMax = cr.cpMax; }
+        else          { ft.chrg.cpMin = (LONG)docLen;   ft.chrg.cpMax = cr.cpMin; }
+        pos = SendMessageW(g_hwndEdit, EM_FINDTEXTEX, (WPARAM)searchFlags, (LPARAM)&ft);
+        if (pos == -1) {
+            wchar_t msg[600];
+            swprintf_s(msg, L"Cannot find \"%s\".", g_szFind);
+            MessageBoxW(g_hwndFR ? g_hwndFR : g_hwndMain, msg, L"longpad", MB_ICONINFORMATION);
+            return false;
+        }
+    }
+    SendMessageW(g_hwndEdit, EM_EXSETSEL, 0, (LPARAM)&ft.chrgText);
+    SendMessageW(g_hwndEdit, EM_SCROLLCARET, 0, 0);
+    if (!g_hwndFR) SetFocus(g_hwndEdit);
+    return true;
+}
+
+static void ReplaceOne() {
+    CHARRANGE cr{};
+    SendMessageW(g_hwndEdit, EM_EXGETSEL, 0, (LPARAM)&cr);
+    if (cr.cpMin != cr.cpMax) {
+        FINDTEXTEXW ft{};
+        ft.chrg = cr;
+        ft.lpstrText = g_szFind;
+        DWORD searchFlags = (g_fr.Flags & (FR_MATCHCASE | FR_WHOLEWORD)) | FR_DOWN;
+        LRESULT pos = SendMessageW(g_hwndEdit, EM_FINDTEXTEX, (WPARAM)searchFlags, (LPARAM)&ft);
+        if (pos != -1 && ft.chrgText.cpMin == cr.cpMin && ft.chrgText.cpMax == cr.cpMax)
+            SendMessageW(g_hwndEdit, EM_REPLACESEL, TRUE, (LPARAM)g_szReplace);
+    }
+    FindNext(false);
+}
+
+static void ReplaceAll() {
+    CHARRANGE crStart{ 0, 0 };
+    SendMessageW(g_hwndEdit, EM_EXSETSEL, 0, (LPARAM)&crStart);
+    int count = 0;
+    SendMessageW(g_hwndEdit, WM_SETREDRAW, FALSE, 0);
+    FINDTEXTEXW ft{};
+    ft.lpstrText = g_szFind;
+    DWORD searchFlags = (g_fr.Flags & ~FR_DOWN) | FR_DOWN;
+    LONG searchFrom = 0;
+    while (true) {
+        ft.chrg.cpMin = searchFrom;
+        ft.chrg.cpMax = -1;
+        if (SendMessageW(g_hwndEdit, EM_FINDTEXTEX, (WPARAM)searchFlags, (LPARAM)&ft) == -1) break;
+        SendMessageW(g_hwndEdit, EM_EXSETSEL, 0, (LPARAM)&ft.chrgText);
+        SendMessageW(g_hwndEdit, EM_REPLACESEL, TRUE, (LPARAM)g_szReplace);
+        ++count;
+        searchFrom = ft.chrgText.cpMin + (LONG)wcslen(g_szReplace);
+    }
+    SendMessageW(g_hwndEdit, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_hwndEdit, nullptr, FALSE);
+    wchar_t msg[128];
+    swprintf_s(msg, L"%d replacement(s) made.", count);
+    MessageBoxW(g_hwndFR ? g_hwndFR : g_hwndMain, msg, L"longpad", MB_ICONINFORMATION);
+}
+
 // ---- Accelerator table ----
 static HACCEL CreateAccel() {
     ACCEL accels[] = {
-        { FVIRTKEY | FCONTROL,         'N', IDM_FILE_NEW    },
-        { FVIRTKEY | FCONTROL,         'O', IDM_FILE_OPEN   },
-        { FVIRTKEY | FCONTROL,         'S', IDM_FILE_SAVE   },
-        { FVIRTKEY | FCONTROL | FSHIFT,'S', IDM_FILE_SAVEAS },
-        { FVIRTKEY | FCONTROL,         'Q', IDM_FILE_EXIT   },
+        { FVIRTKEY | FCONTROL,          'N', IDM_FILE_NEW      },
+        { FVIRTKEY | FCONTROL,          'O', IDM_FILE_OPEN     },
+        { FVIRTKEY | FCONTROL,          'S', IDM_FILE_SAVE     },
+        { FVIRTKEY | FCONTROL | FSHIFT, 'S', IDM_FILE_SAVEAS   },
+        { FVIRTKEY | FCONTROL,          'Q', IDM_FILE_EXIT     },
+        { FVIRTKEY | FCONTROL,          'F', IDM_EDIT_FIND     },
+        { FVIRTKEY,                     VK_F3, IDM_EDIT_FINDNEXT },
+        { FVIRTKEY | FSHIFT,            VK_F3, IDM_EDIT_FINDPREV },
+        { FVIRTKEY | FCONTROL,          'H', IDM_EDIT_REPLACE  },
     };
     return CreateAcceleratorTableW(accels, (int)ARRAYSIZE(accels));
 }
 
 // ---- Window procedure ----
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (g_uFindMsg != 0 && msg == g_uFindMsg) {
+        auto* pfr = reinterpret_cast<FINDREPLACEW*>(lp);
+        if      (pfr->Flags & FR_DIALOGTERM) g_hwndFR = nullptr;
+        else if (pfr->Flags & FR_FINDNEXT)   FindNext((pfr->Flags & FR_DOWN) == 0);
+        else if (pfr->Flags & FR_REPLACE)    ReplaceOne();
+        else if (pfr->Flags & FR_REPLACEALL) ReplaceAll();
+        return 0;
+    }
     switch (msg) {
 
     case WM_CREATE: {
@@ -418,6 +561,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Remove 64 KB limit
         SendMessageW(g_hwndEdit, EM_EXLIMITTEXT, 0, (LPARAM)0x7FFFFFFF);
 
+        // Subclass to trim trailing space from double-click selection
+        g_editOrigProc = (WNDPROC)SetWindowLongPtrW(g_hwndEdit, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
+
         // Font: load saved preference or default to Consolas 10pt
         LoadFontFromRegistry();
         ApplyFont();
@@ -433,8 +579,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         AppendMenuW(hFile, MF_STRING, IDM_FILE_SAVE,   L"&Save\tCtrl+S");
         AppendMenuW(hFile, MF_STRING, IDM_FILE_SAVEAS, L"Save &As...\tCtrl+Shift+S");
         AppendMenuW(hFile, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(hFile, MF_STRING, IDM_FILE_EXIT,   L"E&xit");
+        AppendMenuW(hFile, MF_STRING, IDM_FILE_EXIT,   L"E&xit\tCtrl+Q");
         AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hFile, L"&File");
+        HMENU hEdit = CreatePopupMenu();
+        AppendMenuW(hEdit, MF_STRING, IDM_EDIT_FIND,     L"&Find...\tCtrl+F");
+        AppendMenuW(hEdit, MF_STRING, IDM_EDIT_FINDNEXT, L"Find &Next\tF3");
+        AppendMenuW(hEdit, MF_STRING, IDM_EDIT_FINDPREV, L"Find &Previous\tShift+F3");
+        AppendMenuW(hEdit, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(hEdit, MF_STRING, IDM_EDIT_REPLACE,  L"&Replace...\tCtrl+H");
+        AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hEdit, L"&Edit");
         HMENU hFormat = CreatePopupMenu();
         AppendMenuW(hFormat, MF_STRING, IDM_FORMAT_FONT, L"&Font...");
         AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hFormat, L"F&ormat");
@@ -473,6 +626,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             case IDM_FILE_SAVEAS: DoSaveAs();    break;
             case IDM_FILE_EXIT:   SendMessageW(hwnd, WM_CLOSE, 0, 0); break;
             case IDM_FORMAT_FONT: DoChooseFont(); break;
+            case IDM_EDIT_FIND:     DoFindReplace(false); break;
+            case IDM_EDIT_FINDNEXT: FindNext(false);      break;
+            case IDM_EDIT_FINDPREV: FindNext(true);       break;
+            case IDM_EDIT_REPLACE:  DoFindReplace(true);  break;
             }
         }
         return 0;
@@ -528,6 +685,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_DESTROY:
+        if (g_hwndFR)   { DestroyWindow(g_hwndFR);       g_hwndFR   = nullptr; }
         if (g_hFont)    { DeleteObject(g_hFont);         g_hFont    = nullptr; }
         if (g_hRichEdit){ FreeLibrary(g_hRichEdit);      g_hRichEdit = nullptr; }
         PostQuitMessage(0);
@@ -575,6 +733,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     HACCEL hAccel = CreateAccel();
     MSG    msg{};
     while (GetMessageW(&msg, nullptr, 0, 0)) {
+        if (g_hwndFR && IsDialogMessage(g_hwndFR, &msg))
+            continue;
         if (!TranslateAcceleratorW(hwnd, hAccel, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
