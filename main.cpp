@@ -6,6 +6,7 @@
 #include <commdlg.h>
 #include <richedit.h>
 #include <shellapi.h>
+#include <new>
 #include <string>
 #include <thread>
 #include <atomic>
@@ -175,7 +176,12 @@ static void LoadThread(HWND hwnd, std::wstring path) {
     DWORD dataSize = fileSize - dataStart;
 
     // Read entire file into memory (disk I/O on this thread, not main thread)
-    std::string raw(dataSize, '\0');
+    std::string raw;
+    try { raw.resize(dataSize); } catch (...) {
+        CloseHandle(hFile);
+        PostMessageW(hwnd, WM_LOAD_ERROR, ERROR_OUTOFMEMORY, 0);
+        return;
+    }
     DWORD totalRead = 0;
     while (totalRead < dataSize) {
         DWORD toRead = (std::min)(dataSize - totalRead, (DWORD)(1024 * 1024));
@@ -189,21 +195,29 @@ static void LoadThread(HWND hwnd, std::wstring path) {
 
     // Convert to UTF-16 (wstring)
     int wlen = MultiByteToWideChar(cp, 0, raw.c_str(), (int)raw.size(), nullptr, 0);
-    if (wlen < 0) wlen = 0;
-    auto* wtext = new std::wstring(wlen, L'\0');
+    if (wlen == 0 && !raw.empty()) {
+        PostMessageW(hwnd, WM_LOAD_ERROR, ERROR_NO_UNICODE_TRANSLATION, 0);
+        return;
+    }
+    auto* wtext = new (std::nothrow) std::wstring(wlen, L'\0');
+    if (!wtext) {
+        PostMessageW(hwnd, WM_LOAD_ERROR, ERROR_OUTOFMEMORY, 0);
+        return;
+    }
     if (wlen > 0)
         MultiByteToWideChar(cp, 0, raw.c_str(), (int)raw.size(), wtext->data(), wlen);
 
-    PostMessageW(hwnd, WM_LOAD_DONE, 0, (LPARAM)wtext);
+    if (!PostMessageW(hwnd, WM_LOAD_DONE, 0, (LPARAM)wtext))
+        delete wtext;
 }
 
 // ---- In-memory EM_STREAMIN callback ----
-struct MemStream { const BYTE* ptr; LONG size; LONG pos; };
+struct MemStream { const BYTE* ptr; LONGLONG size; LONGLONG pos; };
 
 static DWORD CALLBACK MemStreamInCb(DWORD_PTR cookie, LPBYTE buf, LONG cb, LONG* pcb) {
-    auto* ms   = reinterpret_cast<MemStream*>(cookie);
-    LONG  avail = ms->size - ms->pos;
-    LONG  n     = (std::min)(cb, avail);
+    auto* ms      = reinterpret_cast<MemStream*>(cookie);
+    LONGLONG avail = ms->size - ms->pos;
+    LONG  n       = (LONG)(std::min)((LONGLONG)cb, avail);
     if (n > 0) {
         memcpy(buf, ms->ptr + ms->pos, n);
         ms->pos += n;
@@ -675,7 +689,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wtext && !wtext->empty()) {
             MemStream ms{
                 reinterpret_cast<const BYTE*>(wtext->data()),
-                (LONG)(wtext->size() * sizeof(wchar_t)),
+                (LONGLONG)(wtext->size() * sizeof(wchar_t)),
                 0
             };
             EDITSTREAM es{(DWORD_PTR)&ms, 0, MemStreamInCb};
