@@ -23,6 +23,7 @@
 #define IDM_EDIT_FINDNEXT   108
 #define IDM_EDIT_FINDPREV   109
 #define IDM_EDIT_REPLACE    110
+#define IDM_FORMAT_WORDWRAP 111
 
 // Control IDs
 #define ID_EDIT   201
@@ -39,8 +40,9 @@ static HMODULE   g_hRichEdit;
 static HFONT     g_hFont;
 static LOGFONTW  g_logFont;
 static std::wstring g_currentFile;
-static bool      g_dirty   = false;
-static bool      g_loading = false;
+static bool      g_dirty    = false;
+static bool      g_loading  = false;
+static bool      g_wordWrap = false;
 
 static WNDPROC g_editOrigProc = nullptr;
 
@@ -354,6 +356,9 @@ static void LoadFontFromRegistry() {
     size = sizeof(val);
     if (RegQueryValueExW(hKey, L"FontCharSet", nullptr, &type, (BYTE*)&val, &size) == ERROR_SUCCESS && type == REG_DWORD)
         g_logFont.lfCharSet = (BYTE)val;
+    size = sizeof(val);
+    if (RegQueryValueExW(hKey, L"WordWrap", nullptr, &type, (BYTE*)&val, &size) == ERROR_SUCCESS && type == REG_DWORD)
+        g_wordWrap = (val != 0);
 
     RegCloseKey(hKey);
 }
@@ -373,6 +378,8 @@ static void SaveFontToRegistry() {
     RegSetValueExW(hKey, L"FontItalic", 0, REG_DWORD, (const BYTE*)&val, sizeof(val));
     val = g_logFont.lfCharSet;
     RegSetValueExW(hKey, L"FontCharSet", 0, REG_DWORD, (const BYTE*)&val, sizeof(val));
+    val = g_wordWrap ? 1 : 0;
+    RegSetValueExW(hKey, L"WordWrap", 0, REG_DWORD, (const BYTE*)&val, sizeof(val));
 
     RegCloseKey(hKey);
 }
@@ -383,6 +390,22 @@ static void ApplyFont() {
     SendMessageW(g_hwndEdit, WM_SETFONT, (WPARAM)hNew, TRUE);
     if (g_hFont) DeleteObject(g_hFont);
     g_hFont = hNew;
+}
+
+static void ApplyWordWrap(bool enable) {
+    SendMessageW(g_hwndEdit, EM_SETTARGETDEVICE, 0, enable ? 0 : 1);
+    ShowScrollBar(g_hwndEdit, SB_HORZ, !enable);
+    InvalidateRect(g_hwndEdit, nullptr, FALSE);
+    HMENU hFormat = GetSubMenu(GetMenu(g_hwndMain), 2); // File=0, Edit=1, Format=2
+    if (hFormat)
+        CheckMenuItem(hFormat, IDM_FORMAT_WORDWRAP,
+                      MF_BYCOMMAND | (enable ? MF_CHECKED : MF_UNCHECKED));
+    g_wordWrap = enable;
+}
+
+static void DoToggleWordWrap() {
+    ApplyWordWrap(!g_wordWrap);
+    SaveFontToRegistry();
 }
 
 static void DoChooseFont() {
@@ -523,6 +546,7 @@ static HACCEL CreateAccel() {
         { FVIRTKEY,                     VK_F3, IDM_EDIT_FINDNEXT },
         { FVIRTKEY | FSHIFT,            VK_F3, IDM_EDIT_FINDPREV },
         { FVIRTKEY | FCONTROL,          'H', IDM_EDIT_REPLACE  },
+        { FVIRTKEY | FALT,              'Z', IDM_FORMAT_WORDWRAP },
     };
     return CreateAcceleratorTableW(accels, (int)ARRAYSIZE(accels));
 }
@@ -540,6 +564,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
 
     case WM_CREATE: {
+        g_hwndMain = hwnd;
         if (!(g_hRichEdit = LoadLibraryW(L"riched20.dll"))) {
             MessageBoxW(nullptr, L"Could not load riched20.dll", L"longpad", MB_ICONERROR);
             return -1;
@@ -590,8 +615,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hEdit, L"&Edit");
         HMENU hFormat = CreatePopupMenu();
         AppendMenuW(hFormat, MF_STRING, IDM_FORMAT_FONT, L"&Font...");
+        AppendMenuW(hFormat, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(hFormat, MF_STRING, IDM_FORMAT_WORDWRAP, L"&Word Wrap\tAlt+Z");
         AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hFormat, L"F&ormat");
         SetMenu(hwnd, hMenu);
+        ApplyWordWrap(g_wordWrap);
 
         UpdateTitle();
         UpdateStatusBar();
@@ -625,7 +653,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             case IDM_FILE_SAVE:   DoSave();      break;
             case IDM_FILE_SAVEAS: DoSaveAs();    break;
             case IDM_FILE_EXIT:   SendMessageW(hwnd, WM_CLOSE, 0, 0); break;
-            case IDM_FORMAT_FONT: DoChooseFont(); break;
+            case IDM_FORMAT_FONT:     DoChooseFont();     break;
+            case IDM_FORMAT_WORDWRAP: DoToggleWordWrap(); break;
             case IDM_EDIT_FIND:     DoFindReplace(false); break;
             case IDM_EDIT_FINDNEXT: FindNext(false);      break;
             case IDM_EDIT_FINDPREV: FindNext(true);       break;
@@ -657,6 +686,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(g_hwndEdit, EM_SETSEL, 0, 0);
         SendMessageW(g_hwndEdit, EM_SETREADONLY, FALSE, 0);
         SendMessageW(g_hwndEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE);
+        ApplyWordWrap(g_wordWrap);
         g_loading = false;
         SetFocus(g_hwndEdit);
         MarkClean();
